@@ -19,10 +19,15 @@
 (define-constant ERR_HUNT_FULL (err u109))
 (define-constant ERR_INVALID_HUNT_ID (err u110))
 (define-constant ERR_HUNT_NOT_EXPIRED (err u113))
+(define-constant ERR_INVALID_DIFFICULTY (err u114))
+(define-constant DIFFICULTY_BASE_MULTIPLIER u100)
+(define-constant MAX_DIFFICULTY_MULTIPLIER u300)
+(define-constant MIN_DIFFICULTY_MULTIPLIER u50)
 
 (define-data-var next-hunt-id uint u1)
 (define-data-var total-hunts-created uint u0)
 (define-data-var total-rewards-distributed uint u0)
+(define-data-var global-completion-rate uint u0)
 
 (define-map hunts
   { hunt-id: uint }
@@ -38,7 +43,10 @@
     current-participants: uint,
     start-block: uint,
     end-block: uint,
-    is-active: bool
+    is-active: bool,
+    difficulty-score: uint,
+    base-reward: uint,
+    final-reward: uint
   }
 )
 
@@ -70,6 +78,16 @@
   }
 )
 
+(define-map hunt-difficulty-metrics
+  { hunt-id: uint }
+  {
+    time-pressure-factor: uint,
+    location-remoteness: uint,
+    completion-rate: uint,
+    multiplier-applied: uint
+  }
+)
+
 (define-public (create-hunt 
   (title (string-ascii 64))
   (description (string-ascii 256))
@@ -85,13 +103,17 @@
       (hunt-id (var-get next-hunt-id))
       (start-block (+ stacks-block-height u1))
       (end-block (+ start-block duration-blocks))
+      (difficulty-score (calculate-hunt-difficulty duration-blocks radius))
+      (multiplier (calculate-reward-multiplier difficulty-score))
+      (final-reward (/ (* reward-amount multiplier) DIFFICULTY_BASE_MULTIPLIER))
     )
     (asserts! (> radius u0) ERR_INVALID_COORDINATES)
     (asserts! (> reward-amount u0) ERR_INSUFFICIENT_REWARDS)
     (asserts! (> max-participants u0) (err u111))
     (asserts! (> duration-blocks u0) (err u112))
+    (asserts! (and (>= multiplier MIN_DIFFICULTY_MULTIPLIER) (<= multiplier MAX_DIFFICULTY_MULTIPLIER)) ERR_INVALID_DIFFICULTY)
     
-    (try! (ft-mint? hunt-token (* reward-amount max-participants) (as-contract tx-sender)))
+    (try! (ft-mint? hunt-token (* final-reward max-participants) (as-contract tx-sender)))
     
     (map-set hunts
       { hunt-id: hunt-id }
@@ -107,7 +129,20 @@
         current-participants: u0,
         start-block: start-block,
         end-block: end-block,
-        is-active: true
+        is-active: true,
+        difficulty-score: difficulty-score,
+        base-reward: reward-amount,
+        final-reward: final-reward
+      }
+    )
+    
+    (map-set hunt-difficulty-metrics
+      { hunt-id: hunt-id }
+      {
+        time-pressure-factor: (calculate-time-pressure duration-blocks),
+        location-remoteness: (calculate-location-remoteness radius),
+        completion-rate: u0,
+        multiplier-applied: multiplier
       }
     )
     
@@ -151,10 +186,10 @@
       (merge hunt { current-participants: (+ (get current-participants hunt) u1) })
     )
     
-    (try! (as-contract (ft-transfer? hunt-token (get reward-amount hunt) tx-sender tx-sender)))
+    (try! (as-contract (ft-transfer? hunt-token (get final-reward hunt) tx-sender tx-sender)))
     
-    (update-user-stats tx-sender (get reward-amount hunt))
-    (var-set total-rewards-distributed (+ (var-get total-rewards-distributed) (get reward-amount hunt)))
+    (update-user-stats tx-sender (get final-reward hunt))
+    (var-set total-rewards-distributed (+ (var-get total-rewards-distributed) (get final-reward hunt)))
     
     (ok true)
   )
@@ -180,7 +215,7 @@
   (let
     (
       (hunt (unwrap! (map-get? hunts { hunt-id: hunt-id }) ERR_HUNT_NOT_FOUND))
-      (remaining-rewards (* (get reward-amount hunt) (- (get max-participants hunt) (get current-participants hunt))))
+      (remaining-rewards (* (get final-reward hunt) (- (get max-participants hunt) (get current-participants hunt))))
     )
     (asserts! (is-eq tx-sender (get creator hunt)) ERR_UNAUTHORIZED)
     (asserts! (> stacks-block-height (get end-block hunt)) ERR_HUNT_NOT_EXPIRED)
@@ -203,6 +238,52 @@
       (radius-squared (* (to-int radius) (to-int radius)))
     )
     (<= distance-squared radius-squared)
+  )
+)
+
+(define-private (calculate-hunt-difficulty (duration-blocks uint) (radius uint))
+  (let
+    (
+      (time-factor (calculate-time-pressure duration-blocks))
+      (location-factor (calculate-location-remoteness radius))
+    )
+    (+ time-factor location-factor)
+  )
+)
+
+(define-private (calculate-time-pressure (duration-blocks uint))
+  (if (<= duration-blocks u144)
+    u150
+    (if (<= duration-blocks u1008)
+      u100
+      u75
+    )
+  )
+)
+
+(define-private (calculate-location-remoteness (radius uint))
+  (if (<= radius u100)
+    u125
+    (if (<= radius u500)
+      u100
+      u75
+    )
+  )
+)
+
+(define-private (calculate-reward-multiplier (difficulty-score uint))
+  (let
+    (
+      (base-multiplier DIFFICULTY_BASE_MULTIPLIER)
+      (difficulty-bonus (/ (* difficulty-score u50) u100))
+    )
+    (if (> (+ base-multiplier difficulty-bonus) MAX_DIFFICULTY_MULTIPLIER)
+      MAX_DIFFICULTY_MULTIPLIER
+      (if (< (+ base-multiplier difficulty-bonus) MIN_DIFFICULTY_MULTIPLIER)
+        MIN_DIFFICULTY_MULTIPLIER
+        (+ base-multiplier difficulty-bonus)
+      )
+    )
   )
 )
 
@@ -269,6 +350,29 @@
       has-started: (>= stacks-block-height (get start-block hunt))
     })
     none
+  )
+)
+
+(define-read-only (get-hunt-difficulty (hunt-id uint))
+  (map-get? hunt-difficulty-metrics { hunt-id: hunt-id })
+)
+
+(define-read-only (get-difficulty-multiplier (duration-blocks uint) (radius uint))
+  (let
+    (
+      (difficulty-score (calculate-hunt-difficulty duration-blocks radius))
+    )
+    (calculate-reward-multiplier difficulty-score)
+  )
+)
+
+(define-read-only (get-final-reward-preview (base-reward uint) (duration-blocks uint) (radius uint))
+  (let
+    (
+      (difficulty-score (calculate-hunt-difficulty duration-blocks radius))
+      (multiplier (calculate-reward-multiplier difficulty-score))
+    )
+    (/ (* base-reward multiplier) DIFFICULTY_BASE_MULTIPLIER)
   )
 )
 
