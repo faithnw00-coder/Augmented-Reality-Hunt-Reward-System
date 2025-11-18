@@ -78,6 +78,13 @@
   }
 )
 
+(define-map hunt-leaderboard-meta
+  { hunt-id: uint }
+  {
+    next-rank: uint
+  }
+)
+
 (define-map hunt-difficulty-metrics
   { hunt-id: uint }
   {
@@ -163,6 +170,9 @@
     (
       (hunt (unwrap! (map-get? hunts { hunt-id: hunt-id }) ERR_HUNT_NOT_FOUND))
       (participant-key { hunt-id: hunt-id, participant: tx-sender })
+      (leaderboard-meta (default-to { next-rank: u1 } (map-get? hunt-leaderboard-meta { hunt-id: hunt-id })))
+      (rank (get next-rank leaderboard-meta))
+      (completion-time (- stacks-block-height (get start-block hunt)))
     )
     (asserts! (get is-active hunt) ERR_HUNT_NOT_ACTIVE)
     (asserts! (>= stacks-block-height (get start-block hunt)) ERR_HUNT_NOT_ACTIVE)
@@ -170,7 +180,7 @@
     (asserts! (is-none (map-get? hunt-participants participant-key)) ERR_ALREADY_CLAIMED)
     (asserts! (< (get current-participants hunt) (get max-participants hunt)) ERR_HUNT_FULL)
     (asserts! (is-within-geofence location-lat location-lng (get center-lat hunt) (get center-lng hunt) (get radius hunt)) ERR_OUT_OF_GEOFENCE)
-    
+
     (map-set hunt-participants
       participant-key
       {
@@ -180,17 +190,31 @@
         location-lng: location-lng
       }
     )
-    
+
     (map-set hunts
       { hunt-id: hunt-id }
       (merge hunt { current-participants: (+ (get current-participants hunt) u1) })
     )
-    
+
+    (map-set hunt-leaderboard
+      { hunt-id: hunt-id, rank: rank }
+      {
+        participant: tx-sender,
+        completion-time: completion-time,
+        reward-earned: (get final-reward hunt)
+      }
+    )
+
+    (map-set hunt-leaderboard-meta
+      { hunt-id: hunt-id }
+      { next-rank: (+ rank u1) }
+    )
+
     (try! (as-contract (ft-transfer? hunt-token (get final-reward hunt) tx-sender tx-sender)))
-    
+
     (update-user-stats tx-sender (get final-reward hunt))
     (var-set total-rewards-distributed (+ (var-get total-rewards-distributed) (get final-reward hunt)))
-    
+
     (ok true)
   )
 )
@@ -355,6 +379,10 @@
 
 (define-read-only (get-hunt-difficulty (hunt-id uint))
   (map-get? hunt-difficulty-metrics { hunt-id: hunt-id })
+)
+
+(define-read-only (get-hunt-leaderboard-entry (hunt-id uint) (rank uint))
+  (map-get? hunt-leaderboard { hunt-id: hunt-id, rank: rank })
 )
 
 (define-read-only (get-difficulty-multiplier (duration-blocks uint) (radius uint))
