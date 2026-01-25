@@ -20,6 +20,9 @@
 (define-constant ERR_INVALID_HUNT_ID (err u110))
 (define-constant ERR_HUNT_NOT_EXPIRED (err u113))
 (define-constant ERR_INVALID_DIFFICULTY (err u114))
+(define-constant ERR_SELF_REFERRAL (err u115))
+(define-constant ERR_ALREADY_REFERRED (err u116))
+(define-constant REFERRAL_BONUS_PERCENT u10)
 (define-constant DIFFICULTY_BASE_MULTIPLIER u100)
 (define-constant MAX_DIFFICULTY_MULTIPLIER u300)
 (define-constant MIN_DIFFICULTY_MULTIPLIER u50)
@@ -28,6 +31,7 @@
 (define-data-var total-hunts-created uint u0)
 (define-data-var total-rewards-distributed uint u0)
 (define-data-var global-completion-rate uint u0)
+(define-data-var total-referral-bonuses uint u0)
 
 (define-map hunts
   { hunt-id: uint }
@@ -92,6 +96,24 @@
     location-remoteness: uint,
     completion-rate: uint,
     multiplier-applied: uint
+  }
+)
+
+(define-map referrals
+  { referee: principal }
+  {
+    referrer: principal,
+    hunt-id: uint,
+    bonus-paid: uint,
+    referred-at: uint
+  }
+)
+
+(define-map referrer-stats
+  { referrer: principal }
+  {
+    total-referrals: uint,
+    total-bonus-earned: uint
   }
 )
 
@@ -253,6 +275,84 @@
   )
 )
 
+(define-public (participate-with-referral
+  (hunt-id uint)
+  (device-proof-hash (buff 32))
+  (location-lat int)
+  (location-lng int)
+  (referrer principal)
+)
+  (let
+    (
+      (hunt (unwrap! (map-get? hunts { hunt-id: hunt-id }) ERR_HUNT_NOT_FOUND))
+      (participant-key { hunt-id: hunt-id, participant: tx-sender })
+      (leaderboard-meta (default-to { next-rank: u1 } (map-get? hunt-leaderboard-meta { hunt-id: hunt-id })))
+      (rank (get next-rank leaderboard-meta))
+      (completion-time (- stacks-block-height (get start-block hunt)))
+      (referral-bonus (/ (* (get final-reward hunt) REFERRAL_BONUS_PERCENT) u100))
+    )
+    (asserts! (not (is-eq tx-sender referrer)) ERR_SELF_REFERRAL)
+    (asserts! (is-none (map-get? referrals { referee: tx-sender })) ERR_ALREADY_REFERRED)
+    (asserts! (get is-active hunt) ERR_HUNT_NOT_ACTIVE)
+    (asserts! (>= stacks-block-height (get start-block hunt)) ERR_HUNT_NOT_ACTIVE)
+    (asserts! (<= stacks-block-height (get end-block hunt)) ERR_HUNT_EXPIRED)
+    (asserts! (is-none (map-get? hunt-participants participant-key)) ERR_ALREADY_CLAIMED)
+    (asserts! (< (get current-participants hunt) (get max-participants hunt)) ERR_HUNT_FULL)
+    (asserts! (is-within-geofence location-lat location-lng (get center-lat hunt) (get center-lng hunt) (get radius hunt)) ERR_OUT_OF_GEOFENCE)
+
+    (map-set hunt-participants
+      participant-key
+      {
+        claimed-at: stacks-block-height,
+        device-proof-hash: device-proof-hash,
+        location-lat: location-lat,
+        location-lng: location-lng
+      }
+    )
+
+    (map-set hunts
+      { hunt-id: hunt-id }
+      (merge hunt { current-participants: (+ (get current-participants hunt) u1) })
+    )
+
+    (map-set hunt-leaderboard
+      { hunt-id: hunt-id, rank: rank }
+      {
+        participant: tx-sender,
+        completion-time: completion-time,
+        reward-earned: (get final-reward hunt)
+      }
+    )
+
+    (map-set hunt-leaderboard-meta
+      { hunt-id: hunt-id }
+      { next-rank: (+ rank u1) }
+    )
+
+    (map-set referrals
+      { referee: tx-sender }
+      {
+        referrer: referrer,
+        hunt-id: hunt-id,
+        bonus-paid: referral-bonus,
+        referred-at: stacks-block-height
+      }
+    )
+
+    (update-referrer-stats referrer referral-bonus)
+
+    (try! (as-contract (ft-transfer? hunt-token (get final-reward hunt) tx-sender tx-sender)))
+    (try! (ft-mint? hunt-token referral-bonus (as-contract tx-sender)))
+    (try! (as-contract (ft-transfer? hunt-token referral-bonus tx-sender referrer)))
+
+    (update-user-stats tx-sender (get final-reward hunt))
+    (var-set total-rewards-distributed (+ (var-get total-rewards-distributed) (get final-reward hunt)))
+    (var-set total-referral-bonuses (+ (var-get total-referral-bonuses) referral-bonus))
+
+    (ok true)
+  )
+)
+
 (define-private (is-within-geofence (lat int) (lng int) (center-lat int) (center-lng int) (radius uint))
   (let
     (
@@ -307,6 +407,24 @@
         MIN_DIFFICULTY_MULTIPLIER
         (+ base-multiplier difficulty-bonus)
       )
+    )
+  )
+)
+
+(define-private (update-referrer-stats (referrer principal) (bonus uint))
+  (let
+    (
+      (current-stats (default-to 
+        { total-referrals: u0, total-bonus-earned: u0 }
+        (map-get? referrer-stats { referrer: referrer })
+      ))
+    )
+    (map-set referrer-stats
+      { referrer: referrer }
+      {
+        total-referrals: (+ (get total-referrals current-stats) u1),
+        total-bonus-earned: (+ (get total-bonus-earned current-stats) bonus)
+      }
     )
   )
 )
@@ -414,5 +532,24 @@
       (is-none (map-get? hunt-participants { hunt-id: hunt-id, participant: user }))
     )
     false
+  )
+)
+
+(define-read-only (get-referral-info (referee principal))
+  (map-get? referrals { referee: referee })
+)
+
+(define-read-only (get-referrer-stats (referrer principal))
+  (map-get? referrer-stats { referrer: referrer })
+)
+
+(define-read-only (get-total-referral-bonuses)
+  (var-get total-referral-bonuses)
+)
+
+(define-read-only (calculate-referral-bonus (hunt-id uint))
+  (match (map-get? hunts { hunt-id: hunt-id })
+    hunt (some (/ (* (get final-reward hunt) REFERRAL_BONUS_PERCENT) u100))
+    none
   )
 )
